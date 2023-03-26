@@ -1,0 +1,217 @@
+# Load Libraries
+Sys.setenv(JAVA_HOME = "C:\\Program Files\\Java\\jdk-11.0.13")
+options(java.parameters = "-Xmx2G")
+library(r5r)
+library(osmextract)
+library(tidyverse) 
+library(sf)
+library(ggthemes)
+library(ggspatial)
+library(tigris)
+library(wesanderson)
+library(tidytransit)
+library(mapview)
+library(tmap)
+library(ggplot2)
+library(rJava)
+
+# Load networks
+setwd("C:\\Users\\tayqu\\My Drive\\School\\01 Current Semester\\R\\Assignments\\assignment 4")
+
+slo_file <- oe_match("San Luis Obispo")
+streets <- oe_read(slo_file$url, provider = "openstreetmap_fr", 
+                   download_directory = "networks", layer = "lines", quiet = TRUE) %>% 
+           filter(!is.na(highway))
+
+boundary <- places(state = 06) %>%
+                   filter(GEOID == "0668154") %>%
+                   st_transform(st_crs(streets))
+
+ggplot() +
+  geom_sf(boundary, mapping = aes(), colour = "grey90") +
+  geom_sf(st_intersection(streets, boundary), mapping = aes(fill = highway, colour = highway)) +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), rect = element_blank()) +
+  labs(title = "San Luis Obispo Street Network, 2020")
+
+# Load School Locations
+schools <- oe_read(slo_file$url, provider = "openstreetmap_fr", 
+                   download_directory = "networks", layer = "points", quiet = TRUE) %>%
+           filter(str_detect(.$other_tags, '"amenity"=>"school"')) %>%         
+           st_transform(st_crs(boundary))
+schools <- st_intersection(schools, boundary)
+schools <- rename(schools, id = osm_id)
+
+ggplot() +
+  geom_sf(boundary, mapping = aes(), colour = "grey90") +
+  geom_sf(st_intersection(streets, boundary), mapping = aes( ), colour = "grey60") +
+  geom_sf(schools, mapping = aes(), colour = "blue", size = 1) +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), rect = element_blank()) +
+  labs(title = "San Luis Obispo Street Network with Schools, 2020")
+
+# Set up grid of points
+grid <- st_sf(st_make_grid(boundary, square = FALSE, n = c(100,100), what = "polygons")) %>%
+        st_filter(boundary)
+
+# Rename column in `grid` data frame
+colnames(grid) <- "geometry"
+st_geometry(grid) <- "geometry"
+
+# Add `id` column to `grid` data frame
+grid <- grid %>%
+  mutate(id = seq(1, nrow(grid), by=1))
+
+# Calculate centroids of grid cells
+points <- st_centroid(grid)
+
+# Plot street network, schools, and grid
+ggplot() +
+  geom_sf(grid, mapping = aes(), color = "white") +
+  geom_sf(st_intersection(streets, boundary), mapping = aes(), color = "grey60") +
+  geom_sf(schools, mapping = aes(), color = "blue", size = 1) +
+  theme(axis.text.x = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        rect = element_blank()) +
+  labs(title = "San Luis Obispo Street Network and Schools with Grid, 2020")
+
+# Set up R5 core for travel time calculations
+r5r_core <- setup_r5("networks", verbose = FALSE)
+
+# Calculate travel times from schools to grid centroids
+ttm <- travel_time_matrix(r5r_core = r5r_core,
+                         origins = schools,
+                         destinations = points,
+                         mode = c("WALK", "TRANSIT"),
+                         departure_datetime = as.POSIXct("15-02-2022 14:00:00", format = "%d-%m-%Y %H:%M:%S"),
+                         max_walk_dist = 1000,
+                         max_trip_duration = 480,
+                         verbose = FALSE)
+
+# Wide format of travel times and merge with `grid`
+tt_wide <- ttm %>%
+  pivot_wider(names_from = fromId, 
+              names_prefix = "from", values_from = travel_time) %>%
+  rename(id = toId) %>% 
+  merge(grid) %>%
+  replace(is.na(.), 999) %>%
+  rowwise() %>%
+  mutate(from_any = min(c_across(starts_with("from")), na.rm = TRUE))
+
+# Update geometry in `tt_wide`
+st_geometry(tt_wide) <- "geometry"
+
+# Plot travel times to schools
+ggplot() +
+  geom_sf(tt_wide, mapping = aes(fill = from_any)) +
+  geom_sf(schools, mapping = aes(), color = "red", size = 1) +
+  theme(axis.text.x = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(), 
+        rect = element_blank()) +
+  labs(title = "San Luis Obispo Travel Times to Schools via Transit, 2020")
+
+# Create Isochrones
+
+# Step 1
+iso <- tt_wide %>%
+  select(id, from_any) %>%
+  mutate(traveltimes = case_when(
+    (from_any < 11) ~ "0-10",
+    (from_any >= 11 & from_any < 21) ~ "11-20",
+    (from_any >= 21 & from_any < 31) ~ "21-30",
+    (from_any >= 31) ~ "31+"))
+
+# Step 2
+ggplot() +
+  geom_sf(iso, mapping = aes(fill = traveltimes)) +
+  geom_sf(schools, mapping = aes(), color = "blue", size = 1) +
+  geom_sf(st_intersection(streets, boundary), mapping = aes(), color = "grey80") +
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks = element_blank(), rect = element_blank()) +
+  labs(title = "San Luis Obispo Travel Times to Schools via Transit, 2020")
+
+# Step 3
+cat("Area under 11 mins:", sum(st_area(iso[iso$traveltimes == "0-10",])), "m^2",
+    "\nArea between 11-20 mins:", sum(st_area(iso[iso$traveltimes == "11-20",])), "m^2",
+    "\nArea between 21-30 mins:", sum(st_area(iso[iso$traveltimes == "21-30",])), "m^2",
+    "\nArea over 31 mins:", sum(st_area(iso[iso$traveltimes == "31+",])), "m^2")
+
+# Loading Transit Stop Locations and Creating Grid Cells
+
+# Step 1
+transit <- read_gtfs("C:\\Users\\tayqu\\My Drive\\School\\01 Current Semester\\R\\Assignments\\assignment 4\\networks\\SLOgtfs.zip")
+stops <- transit$stops
+
+# Step 2
+# Check columns names, number of rows, and class
+colnames(stops)
+nrow(stops)
+class(stops)
+
+# Step 3
+stops <- st_as_sf(stops, coords = c("stop_lon", "stop_lat"), crs = st_crs(iso))
+
+# Step 4
+tstops <- st_join(iso, stops)
+tstops <- tstops %>%
+  group_by(id) %>%
+  mutate(num_stops = n()) %>%
+  filter(!is.na(stop_id))
+
+# Step 5
+tstop_points <- st_centroid(tstops)
+
+# Step 6
+qtm(stops, dots.col = "blue") + qtm(points, dots.col = "grey")
+
+# Calculate Accessibility
+# Define a step decay function for accessibility
+transit_access1 <- accessibility(r5r_core,
+                                 origins = points,
+                                 destinations = tstop_points,
+                                 mode = "WALK",
+                                 opportunities_colname = "num_stops",
+                                 decay_function = "step",
+                                 cutoffs = 11,
+                                 departure_datetime = as.POSIXct("15-2-2022 14:00:00", format = "%d-%m-%Y %H:%M:%S"),
+                                 max_walk_dist = 500,
+                                 time_window = 60,
+                                 percentiles = 50,
+                                 verbose = FALSE) %>%
+                   mutate(id = as.numeric(from_id)) %>%
+                   merge(grid)
+
+# Set the geometry for the `transit_access1` object
+st_geometry(transit_access1) <- "geometry"
+
+# Plot the `transit_access1` object using the `qtm` function
+qtm(transit_access1, fill = "accessibility")
+
+# Define an exponential decay function for accessibility
+transit_access2 <- accessibility(r5r_core,
+                                 origins = points,
+                                 destinations = tstop_points,
+                                 mode = "WALK",
+                                 opportunities_colname = "num_stops",
+                                 decay_function = "exponential",
+                                 cutoffs = 5,
+                                 departure_datetime = as.POSIXct("15-2-2022 14:00:00", format = "%d-%m-%Y %H:%M:%S"),
+                                 max_walk_dist = 500,
+                                 time_window = 60,
+                                 percentiles = 50,
+                                 verbose = FALSE) %>%
+                   mutate(id = as.numeric(from_id)) %>%
+                   merge(grid)
+
+# Set the geometry for the `transit_access2` object
+st_geometry(transit_access2) <- "geometry"
+
+# Plot the `transit_access2` object using the `qtm` function
+qtm(transit_access2, fill = "accessibility")
+
+# Clean up resources used by `r5r_core`
+stop_r5(r5r_core)
+
+# Call the garbage collector to free up unused memory
+rJava::.jgc(R.gc = TRUE)
